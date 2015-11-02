@@ -61,17 +61,19 @@ int ss_is_valid_cred(const char *method, const char *password)
     return 1;
 }
 
-void ss_client_init(redsocks_client *client)
+static void ss_client_init(redsocks_client *client)
 {
     ss_client *sclient = (void*)(client + 1);
     ss_instance * ss = (ss_instance *)(client->instance+1);
 
     client->state = ss_new;
-    enc_ctx_init(&ss->info, &sclient->e_ctx, 1);
-    enc_ctx_init(&ss->info, &sclient->d_ctx, 0);
+    if (enc_ctx_init(&ss->info, &sclient->e_ctx, 1))
+        log_error(LOG_ERR, "Shadowsocks failed to initialize encryption context.");
+    if (enc_ctx_init(&ss->info, &sclient->d_ctx, 0))
+        log_error(LOG_ERR, "Shadowsocks failed to initialize decryption context.");
 }
 
-void ss_client_fini(redsocks_client *client)
+static void ss_client_fini(redsocks_client *client)
 {
     ss_client *sclient = (void*)(client + 1);
     enc_ctx_free(&sclient->e_ctx);
@@ -148,18 +150,14 @@ static void ss_client_writecb(struct bufferevent *buffev, void *_arg)
     redsocks_client *client = _arg;
     struct bufferevent * from = client->relay;
     struct bufferevent * to   = buffev;
-    char from_eof = client->relay_evshut & EV_READ;
     size_t input_size = evbuffer_get_contiguous_space(bufferevent_get_input(from));
     size_t output_size = evbuffer_get_length(bufferevent_get_output(to));
 
     assert(buffev == client->client);
     redsocks_touch_client(client);
 
-    if (input_size == 0 && from_eof)
-    {
-        redsocks_shutdown(client, to, SHUT_WR);
+    if (process_shutdown_on_write_(client, from, to))
         return;
-    }
 
     if (client->state == ss_connected) 
     {
@@ -168,7 +166,7 @@ static void ss_client_writecb(struct bufferevent *buffev, void *_arg)
         {
             if (input_size)
                 decrypt_buffer(client, from, to);
-            if (bufferevent_enable(from, EV_READ) == -1)
+            if (!(client->relay_evshut & EV_READ) && bufferevent_enable(from, EV_READ) == -1)
                 redsocks_log_errno(client, LOG_ERR, "bufferevent_enable");
         }
     }
@@ -215,18 +213,14 @@ static void ss_relay_writecb(struct bufferevent *buffev, void *_arg)
     redsocks_client *client = _arg;
     struct bufferevent * from = client->client;
     struct bufferevent * to   = buffev;
-    char from_eof = client->client_evshut & EV_READ;
     size_t input_size = evbuffer_get_contiguous_space(bufferevent_get_input(from));
     size_t output_size = evbuffer_get_length(bufferevent_get_output(to));
 
     assert(buffev == client->relay);
     redsocks_touch_client(client);
 
-    if (input_size == 0 && from_eof)
-    {
-        redsocks_shutdown(client, to, SHUT_WR);
+    if (process_shutdown_on_write_(client, from, to))
         return;
-    }
 
     if (client->state == ss_connected) 
     {
@@ -235,8 +229,8 @@ static void ss_relay_writecb(struct bufferevent *buffev, void *_arg)
         {
             if (input_size)
                 encrypt_buffer(client, from, to);
-            if (bufferevent_enable(from, EV_READ) == -1)
-                    redsocks_log_errno(client, LOG_ERR, "bufferevent_enable");
+            if (!(client->client_evshut & EV_READ) && bufferevent_enable(from, EV_READ) == -1)
+                redsocks_log_errno(client, LOG_ERR, "bufferevent_enable");
         }
     }
     else
@@ -294,6 +288,7 @@ static void ss_relay_connected(struct bufferevent *buffev, void *_arg)
         return;
     }
 
+    client->relay_connected = 1;
     /* We do not need to detect timeouts any more.
     The two peers will handle it. */
     bufferevent_set_timeouts(client->relay, NULL, NULL);
@@ -335,7 +330,7 @@ static void ss_relay_connected(struct bufferevent *buffev, void *_arg)
 }
 
 
-static void ss_connect_relay(redsocks_client *client)
+static int ss_connect_relay(redsocks_client *client)
 {
     struct timeval tv;
 
@@ -352,7 +347,9 @@ static void ss_connect_relay(redsocks_client *client)
     if (!client->relay) {
         redsocks_log_errno(client, LOG_ERR, "ss_connect_relay");
         redsocks_drop_client(client);
+        return -1;
     }
+    return 0;
 }
 
 static int ss_instance_init(struct redsocks_instance_t *instance)
